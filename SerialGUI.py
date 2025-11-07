@@ -14,6 +14,7 @@ from PyQt5.QtWidgets import (
     QTableWidgetItem,
     QFileDialog,
     QHeaderView,
+    QComboBox,
     QSpinBox,
 )
 
@@ -23,6 +24,7 @@ import time
 import csv
 
 import serial
+from serial.tools import list_ports
 
 from SerialFinder import select_serial_port  # uses your existing helper
 
@@ -115,14 +117,17 @@ class SerialGUI(QWidget):
 
     def __init__(self, preferred_port="COM5", baud=DEFAULT_BAUD):
         super().__init__()
-        self.setWindowTitle("Serial COM GUI — PyQt")
+        self.setWindowTitle("MicroTunnel DAQ")
         # Increase initial window size so controls have room and text won't be clipped
         # Keep application font at the system default so text size remains unchanged
         self.resize(1600, 900)
 
         # Serial state
         self.baud = baud
+        self.preferred_port = preferred_port
         self.ser = None
+        # connection tracking
+        self._last_connected = False
         self.ser_lock = threading.Lock()
         self.reader = None
         # collection state for Take Data
@@ -163,8 +168,59 @@ class SerialGUI(QWidget):
         airspeed_layout.addWidget(self.airspeed_value)
         control_layout.addLayout(airspeed_layout)
 
+        # add a block of space before the Connected label so it sits separated to the right
+        control_layout.addSpacing(30)
+
+        # Port controls on the right: connected port label and dropdown of available ports
+        # status light, static label, port name, and status text
+        # connection label
+        self.connection_label = QLabel("Connection:")
+        control_layout.addWidget(self.connection_label)
+
+        # port dropdown next to the Connection label
+        self.port_combo = QComboBox()
+        self.port_combo.setFixedWidth(220)
+        self.port_combo.activated.connect(lambda _: self.on_port_selected())
+        control_layout.addWidget(self.port_combo)
+
+        # small status light (will be updated to green/red or flashing)
+        self.status_light = QLabel()
+        self.status_light.setFixedSize(14, 14)
+        self.status_light.setStyleSheet("border-radius:7px; background: transparent;")
+        control_layout.addWidget(self.status_light)
+
+        # textual status (CONNECTED / OFFLINE)
+        self.status_text_label = QLabel("OFFLINE")
+        control_layout.addWidget(self.status_text_label)
+        # keep a non-visible port name label for internal updates (not shown)
+        self.port_name_label = QLabel("None")
+        # populate available ports
+        try:
+            ports = self.refresh_ports()
+        except Exception:
+            ports = []
+        # create a port-refresh timer (used while offline to detect newly-plugged devices)
+        try:
+            self._port_refresh_timer = QtCore.QTimer(self)
+            self._port_refresh_timer.setInterval(2000)
+            self._port_refresh_timer.timeout.connect(self.refresh_ports)
+        except Exception:
+            self._port_refresh_timer = None
+        # connection monitor: always check whether serial device is still present
+        try:
+            self._conn_monitor_timer = QtCore.QTimer(self)
+            self._conn_monitor_timer.setInterval(1000)
+            self._conn_monitor_timer.timeout.connect(self._check_connection)
+            self._conn_monitor_timer.start()
+        except Exception:
+            self._conn_monitor_timer = None
+        except Exception:
+            pass
+
     # displacement control for airspeed plot y-bounds (moved below the time plot)
 
+        # add a bit of spacing to the left of the Take Data button
+        control_layout.addSpacing(12)
         self.take_btn = QPushButton("Take Data")
         self.take_btn.clicked.connect(self.take_data)
         control_layout.addWidget(self.take_btn)
@@ -241,7 +297,15 @@ class SerialGUI(QWidget):
 
         # Try to open serial port. If none is found, continue in offline mode
         # (keep the GUI open but disable serial-dependent controls).
-        device = select_serial_port(preferred_port)
+        # Prefer the combo selection if present, otherwise fall back to select_serial_port
+        device = None
+        try:
+            if self.port_combo.count() > 0:
+                device = self.port_combo.currentText()
+        except Exception:
+            device = None
+        if not device:
+            device = select_serial_port(preferred_port)
         if not device:
             # Don't close the GUI — run in offline mode so user can still use the UI
             # (export/save and plotting without serial data). Log the state and
@@ -249,6 +313,15 @@ class SerialGUI(QWidget):
             self.log_message("No serial device selected/found — running in offline mode.")
             self.take_btn.setEnabled(False)
             self.save_btn.setEnabled(False)
+            # initialize status and start port scanning
+            try:
+                self.port_name_label.setText("None")
+            except Exception:
+                pass
+            try:
+                self.set_connection_state(False)
+            except Exception:
+                pass
         else:
             try:
                 self.ser = serial.Serial(device, self.baud, timeout=0.1)
@@ -258,7 +331,16 @@ class SerialGUI(QWidget):
                 self.take_btn.setEnabled(False)
                 self.save_btn.setEnabled(False)
             else:
+                # update UI with connected port
                 self.log_message(f"Connected to {self.ser.port} at {self.baud} baud.")
+                try:
+                    self.port_name_label.setText(self.ser.port)
+                except Exception:
+                    pass
+                try:
+                    self.set_connection_state(True)
+                except Exception:
+                    pass
 
                 # Start reader thread
                 self.reader = SerialReaderThread(self.ser, self.ser_lock)
@@ -276,6 +358,232 @@ class SerialGUI(QWidget):
         timestamp = time.strftime("%H:%M:%S")
         # Print to stdout instead of a GUI log box
         print(f"[{timestamp}] {msg}", flush=True)
+
+    def refresh_ports(self):
+        """Refresh the list of available serial ports into the combo box."""
+        ports = []
+        try:
+            ports = [p.device for p in list_ports.comports()]
+        except Exception:
+            ports = []
+        # remember selection
+        cur = None
+        try:
+            cur = self.port_combo.currentText()
+        except Exception:
+            cur = None
+        self.port_combo.blockSignals(True)
+        self.port_combo.clear()
+        for p in ports:
+            self.port_combo.addItem(p)
+        # restore selection if possible
+        if cur and cur in ports:
+            idx = ports.index(cur)
+            self.port_combo.setCurrentIndex(idx)
+        self.port_combo.blockSignals(False)
+        # If we're currently offline, attempt an auto-connect if a port appears.
+        try:
+            offline = False
+            try:
+                offline = (self.status_text_label.text().upper() == "OFFLINE")
+            except Exception:
+                offline = (not (self.ser and getattr(self.ser, 'is_open', False)))
+            if offline and ports:
+                # prefer preferred_port if present
+                try:
+                    pref = getattr(self, 'preferred_port', None)
+                    if pref and pref in ports:
+                        idx = ports.index(pref)
+                        self.port_combo.setCurrentIndex(idx)
+                        QtCore.QTimer.singleShot(0, self.on_port_selected)
+                    else:
+                        # otherwise try the first available port
+                        self.port_combo.setCurrentIndex(0)
+                        QtCore.QTimer.singleShot(0, self.on_port_selected)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    def on_port_selected(self):
+        """Handler when the user selects a port from the dropdown.
+        Try to open the selected port and start the reader.
+        """
+        try:
+            dev = self.port_combo.currentText()
+        except Exception:
+            return
+        if not dev:
+            return
+        # if already connected to this port, do nothing
+        try:
+            if self.ser and getattr(self.ser, 'port', None) == dev and self.ser.is_open:
+                return
+        except Exception:
+            pass
+        # close existing reader/serial if present
+        try:
+            if self.reader:
+                self.reader.stop()
+                self.reader = None
+        except Exception:
+            pass
+        try:
+            if self.ser and self.ser.is_open:
+                self.ser.close()
+        except Exception:
+            pass
+
+        # attempt to open new port
+        try:
+            self.ser = serial.Serial(dev, self.baud, timeout=0.1)
+        except Exception as e:
+            QtWidgets.QMessageBox.warning(self, "Serial Error", f"Could not open {dev}: {e}")
+            try:
+                self.port_name_label.setText("None")
+            except Exception:
+                pass
+            try:
+                self.set_connection_state(False)
+            except Exception:
+                pass
+            self.take_btn.setEnabled(False)
+            self.save_btn.setEnabled(False)
+            return
+
+        # success
+        try:
+            self.port_name_label.setText(self.ser.port)
+        except Exception:
+            pass
+        try:
+            self.set_connection_state(True)
+        except Exception:
+            pass
+        self.log_message(f"Connected to {self.ser.port} at {self.baud} baud.")
+        self.take_btn.setEnabled(True)
+        self.save_btn.setEnabled(True)
+        # start reader
+        self.reader = SerialReaderThread(self.ser, self.ser_lock)
+        self.reader.line_received.connect(self.on_line_received)
+        self.reader.polling = True
+        self.reader.poll_interval = 0.05
+        self.reader.start()
+
+    def set_connection_state(self, connected: bool):
+        """Update status text and light. If connected=True show green light and
+        'CONNECTED'. If False, show 'OFFLINE' and flash a red light.
+        """
+        try:
+            if connected:
+                # stop any offline flashing
+                if hasattr(self, '_offline_flash_timer') and self._offline_flash_timer.isActive():
+                    try:
+                        self._offline_flash_timer.stop()
+                    except Exception:
+                        pass
+                # stop port refresh timer while connected
+                try:
+                    if hasattr(self, '_port_refresh_timer') and self._port_refresh_timer is not None and self._port_refresh_timer.isActive():
+                        self._port_refresh_timer.stop()
+                except Exception:
+                    pass
+                self.status_text_label.setText("CONNECTED")
+                self.status_text_label.setStyleSheet("font-weight:bold; color: green;")
+                self.status_light.setStyleSheet("border-radius:7px; background: green;")
+            else:
+                self.status_text_label.setText("OFFLINE")
+                self.status_text_label.setStyleSheet("font-weight:bold; color: red;")
+                # ensure flash timer exists
+                if not hasattr(self, '_offline_flash_timer'):
+                    self._offline_flash_timer = QtCore.QTimer(self)
+                    self._offline_flash_timer.setInterval(600)
+                    self._offline_flash_timer.timeout.connect(self._toggle_offline_light)
+                    self._offline_light_on = False
+                try:
+                    self._offline_flash_timer.start()
+                except Exception:
+                    pass
+                # start port refresh timer while offline so newly-plugged devices are found
+                try:
+                    if hasattr(self, '_port_refresh_timer') and self._port_refresh_timer is not None and not self._port_refresh_timer.isActive():
+                        self._port_refresh_timer.start()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    def _toggle_offline_light(self):
+        """Toggle the offline status light on/off to create a flashing effect."""
+        try:
+            if getattr(self, '_offline_light_on', False):
+                self.status_light.setStyleSheet("border-radius:7px; background: transparent;")
+            else:
+                self.status_light.setStyleSheet("border-radius:7px; background: red;")
+            self._offline_light_on = not getattr(self, '_offline_light_on', False)
+        except Exception:
+            pass
+
+    def _check_connection(self):
+        """Periodic check to detect if the serial device was unplugged.
+        If we were connected and the port is no longer open, mark offline and
+        start scanning for ports.
+        """
+        try:
+            ports = []
+            try:
+                ports = [p.device for p in list_ports.comports()]
+            except Exception:
+                ports = []
+
+            ser_port = None
+            try:
+                ser_port = getattr(self.ser, 'port', None) if self.ser else None
+            except Exception:
+                ser_port = None
+
+            is_open = bool(self.ser and getattr(self.ser, 'is_open', False))
+
+            # If the serial object's port no longer appears in the system list,
+            # treat it as unplugged and transition to OFFLINE.
+            if ser_port and ser_port not in ports:
+                # handle disconnect
+                try:
+                    if self.reader:
+                        self.reader.stop()
+                        self.reader = None
+                except Exception:
+                    pass
+                try:
+                    if self.ser and getattr(self.ser, 'is_open', False):
+                        self.ser.close()
+                except Exception:
+                    pass
+                try:
+                    self.ser = None
+                except Exception:
+                    pass
+                try:
+                    self.port_name_label.setText("None")
+                except Exception:
+                    pass
+                try:
+                    self.set_connection_state(False)
+                except Exception:
+                    pass
+                # ensure port refresh is running so newly-plugged devices are discovered
+                try:
+                    if hasattr(self, '_port_refresh_timer') and self._port_refresh_timer is not None and not self._port_refresh_timer.isActive():
+                        self._port_refresh_timer.start()
+                except Exception:
+                    pass
+                self._last_connected = False
+            else:
+                # update last connected flag if we detect an open port
+                if is_open and not getattr(self, '_last_connected', False):
+                    self._last_connected = True
+        except Exception:
+            pass
 
     def on_line_received(self, line: str):
         # Show raw incoming lines in log
