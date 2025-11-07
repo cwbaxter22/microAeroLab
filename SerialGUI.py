@@ -14,6 +14,7 @@ from PyQt5.QtWidgets import (
     QTableWidgetItem,
     QFileDialog,
     QHeaderView,
+    QComboBox,
     QSpinBox,
 )
 
@@ -23,6 +24,7 @@ import time
 import csv
 
 import serial
+from serial.tools import list_ports
 
 from SerialFinder import select_serial_port  # uses your existing helper
 
@@ -115,7 +117,7 @@ class SerialGUI(QWidget):
 
     def __init__(self, preferred_port="COM5", baud=DEFAULT_BAUD):
         super().__init__()
-        self.setWindowTitle("Serial COM GUI — PyQt")
+        self.setWindowTitle("MicroTunnel DAQ")
         # Increase initial window size so controls have room and text won't be clipped
         # Keep application font at the system default so text size remains unchanged
         self.resize(1600, 900)
@@ -162,6 +164,25 @@ class SerialGUI(QWidget):
         airspeed_layout.addWidget(self.airspeed_label)
         airspeed_layout.addWidget(self.airspeed_value)
         control_layout.addLayout(airspeed_layout)
+
+        # add a block of space before the Connected label so it sits separated to the right
+        control_layout.addSpacing(30)
+
+        # Port controls on the right: connected port label and dropdown of available ports
+        self.connected_label = QLabel("Connected:")
+        control_layout.addWidget(self.connected_label)
+        self.connected_port_label = QLabel("None")
+        control_layout.addWidget(self.connected_port_label)
+
+        self.port_combo = QComboBox()
+        self.port_combo.setFixedWidth(220)
+        self.port_combo.activated.connect(lambda _: self.on_port_selected())
+        control_layout.addWidget(self.port_combo)
+        # populate available ports
+        try:
+            self.refresh_ports()
+        except Exception:
+            pass
 
     # displacement control for airspeed plot y-bounds (moved below the time plot)
 
@@ -241,7 +262,15 @@ class SerialGUI(QWidget):
 
         # Try to open serial port. If none is found, continue in offline mode
         # (keep the GUI open but disable serial-dependent controls).
-        device = select_serial_port(preferred_port)
+        # Prefer the combo selection if present, otherwise fall back to select_serial_port
+        device = None
+        try:
+            if self.port_combo.count() > 0:
+                device = self.port_combo.currentText()
+        except Exception:
+            device = None
+        if not device:
+            device = select_serial_port(preferred_port)
         if not device:
             # Don't close the GUI — run in offline mode so user can still use the UI
             # (export/save and plotting without serial data). Log the state and
@@ -258,7 +287,12 @@ class SerialGUI(QWidget):
                 self.take_btn.setEnabled(False)
                 self.save_btn.setEnabled(False)
             else:
+                # update UI with connected port
                 self.log_message(f"Connected to {self.ser.port} at {self.baud} baud.")
+                try:
+                    self.connected_port_label.setText(self.ser.port)
+                except Exception:
+                    pass
 
                 # Start reader thread
                 self.reader = SerialReaderThread(self.ser, self.ser_lock)
@@ -276,6 +310,80 @@ class SerialGUI(QWidget):
         timestamp = time.strftime("%H:%M:%S")
         # Print to stdout instead of a GUI log box
         print(f"[{timestamp}] {msg}", flush=True)
+
+    def refresh_ports(self):
+        """Refresh the list of available serial ports into the combo box."""
+        ports = []
+        try:
+            ports = [p.device for p in list_ports.comports()]
+        except Exception:
+            ports = []
+        # remember selection
+        cur = None
+        try:
+            cur = self.port_combo.currentText()
+        except Exception:
+            cur = None
+        self.port_combo.blockSignals(True)
+        self.port_combo.clear()
+        for p in ports:
+            self.port_combo.addItem(p)
+        # restore selection if possible
+        if cur and cur in ports:
+            idx = ports.index(cur)
+            self.port_combo.setCurrentIndex(idx)
+        self.port_combo.blockSignals(False)
+
+    def on_port_selected(self):
+        """Handler when the user selects a port from the dropdown.
+        Try to open the selected port and start the reader.
+        """
+        try:
+            dev = self.port_combo.currentText()
+        except Exception:
+            return
+        if not dev:
+            return
+        # if already connected to this port, do nothing
+        try:
+            if self.ser and getattr(self.ser, 'port', None) == dev and self.ser.is_open:
+                return
+        except Exception:
+            pass
+        # close existing reader/serial if present
+        try:
+            if self.reader:
+                self.reader.stop()
+                self.reader = None
+        except Exception:
+            pass
+        try:
+            if self.ser and self.ser.is_open:
+                self.ser.close()
+        except Exception:
+            pass
+
+        # attempt to open new port
+        try:
+            self.ser = serial.Serial(dev, self.baud, timeout=0.1)
+        except Exception as e:
+            QtWidgets.QMessageBox.warning(self, "Serial Error", f"Could not open {dev}: {e}")
+            self.connected_port_label.setText("None")
+            self.take_btn.setEnabled(False)
+            self.save_btn.setEnabled(False)
+            return
+
+        # success
+        self.connected_port_label.setText(self.ser.port)
+        self.log_message(f"Connected to {self.ser.port} at {self.baud} baud.")
+        self.take_btn.setEnabled(True)
+        self.save_btn.setEnabled(True)
+        # start reader
+        self.reader = SerialReaderThread(self.ser, self.ser_lock)
+        self.reader.line_received.connect(self.on_line_received)
+        self.reader.polling = True
+        self.reader.poll_interval = 0.05
+        self.reader.start()
 
     def on_line_received(self, line: str):
         # Show raw incoming lines in log
