@@ -116,7 +116,9 @@ class SerialGUI(QWidget):
     def __init__(self, preferred_port="COM5", baud=DEFAULT_BAUD):
         super().__init__()
         self.setWindowTitle("Serial COM GUI — PyQt")
-        self.resize(1100, 650)
+        # Increase initial window size so controls have room and text won't be clipped
+        # Keep application font at the system default so text size remains unchanged
+        self.resize(1600, 900)
 
         # Serial state
         self.baud = baud
@@ -146,7 +148,7 @@ class SerialGUI(QWidget):
         control_layout.addWidget(self.samples_label)
 
         self.samples_input = QLineEdit("1")
-        self.samples_input.setFixedWidth(80)
+        self.samples_input.setFixedWidth(160)
         self.samples_input.setValidator(QIntValidator(1, 1000000, self))
         self.samples_input.editingFinished.connect(self.update_hz_estimate)
         control_layout.addWidget(self.samples_input)
@@ -207,7 +209,7 @@ class SerialGUI(QWidget):
         # top axes for lift/drag scatter
         self.ax = self.fig.add_subplot(211)
         self.ax.set_xlabel("Wind Speed (MPH)")
-        self.ax.set_ylabel("Lift / Drag (lbs)")
+        self.ax.set_ylabel("Lift, Drag (lbs)")
         self.ax.grid(True)
         # bottom axes for airspeed time series
         self.ax2 = self.fig.add_subplot(212)
@@ -226,7 +228,7 @@ class SerialGUI(QWidget):
         self.disp_label = QLabel("y-axis offset")
         disp_below_layout.addWidget(self.disp_label)
         self.displacement_input = QLineEdit(str(int(self.displacement)))
-        self.displacement_input.setFixedWidth(80)
+        self.displacement_input.setFixedWidth(160)
         self.displacement_input.setValidator(QIntValidator(0, 10000, self))
         self.displacement_input.editingFinished.connect(self.update_displacement)
         disp_below_layout.addWidget(self.displacement_input)
@@ -512,7 +514,7 @@ class SerialGUI(QWidget):
             self.table.setItem(r, j, item)
         # add remove button in last column
         btn = QPushButton("x")
-        btn.setFixedWidth(24)
+        btn.setFixedWidth(48)
         btn.setToolTip("Remove row")
         btn.clicked.connect(self._remove_row_button_clicked)
         self.table.setCellWidget(r, 3, btn)
@@ -698,6 +700,16 @@ class SerialGUI(QWidget):
 
 def main():
     app = QApplication(sys.argv)
+    # Increase application font size to improve readability (scale ~1.6x)
+    try:
+        f = app.font()
+        ps = f.pointSize()
+        if ps <= 0:
+            ps = 10
+        f.setPointSize(max(1, int(ps * 1.6)))
+        app.setFont(f)
+    except Exception:
+        pass
     w = SerialGUI(preferred_port="COM5", baud=DEFAULT_BAUD)
     w.show()
     sys.exit(app.exec_())
