@@ -6,7 +6,7 @@ from PyQt5.QtWidgets import (
     QWidget,
     QVBoxLayout,
     QHBoxLayout,
-    QTextEdit,
+    # QTextEdit removed (log console removed)
     QPushButton,
     QLabel,
     QLineEdit,
@@ -33,7 +33,6 @@ from matplotlib.figure import Figure
 DEFAULT_BAUD = 9600
 READ_TIMEOUT = 2.0
 
-
 class SerialReaderThread(QThread):
     line_received = pyqtSignal(str)
 
@@ -43,6 +42,10 @@ class SerialReaderThread(QThread):
         self.lock = lock
         self._running = True
         self._paused = False
+        # when polling=True the thread will actively send 'H' and read the response
+        self.polling = True
+        # seconds between polls (can be tuned)
+        self.poll_interval = 0.05
 
     def run(self):
         while self._running:
@@ -50,21 +53,43 @@ class SerialReaderThread(QThread):
                 time.sleep(0.05)
                 continue
             try:
-                # Acquire lock so Take Data doesn't race with log reader
-                with self.lock:
-                    if self.ser.in_waiting > 0:
+                # If polling is enabled, actively send 'H' and wait for the response.
+                if self.polling:
+                    with self.lock:
+                        try:
+                            # send probe
+                            self.ser.write(b"H\n")
+                            self.ser.flush()
+                        except Exception:
+                            # writing may fail if port closed
+                            pass
+                        # read one line response (respecting serial timeout)
                         raw = self.ser.readline()
-                    else:
-                        raw = None
-                if raw:
-                    try:
-                        line = raw.decode(errors="ignore").strip()
-                    except Exception:
-                        line = str(raw)
-                    if line:
-                        self.line_received.emit(line)
+                    if raw:
+                        try:
+                            line = raw.decode(errors="ignore").strip()
+                        except Exception:
+                            line = str(raw)
+                        if line:
+                            self.line_received.emit(line)
+                    # sleep small interval before next poll
+                    time.sleep(self.poll_interval)
                 else:
-                    time.sleep(0.05)
+                    # passive read: grab any waiting data
+                    with self.lock:
+                        if self.ser.in_waiting > 0:
+                            raw = self.ser.readline()
+                        else:
+                            raw = None
+                    if raw:
+                        try:
+                            line = raw.decode(errors="ignore").strip()
+                        except Exception:
+                            line = str(raw)
+                        if line:
+                            self.line_received.emit(line)
+                    else:
+                        time.sleep(0.05)
             except Exception as e:
                 self.line_received.emit(f"[reader error] {e}")
                 time.sleep(0.5)
@@ -90,7 +115,6 @@ class SerialGUI(QWidget):
 
     def __init__(self, preferred_port="COM5", baud=DEFAULT_BAUD):
         super().__init__()
-        print("[debug] SerialGUI.__init__: starting", flush=True)
         self.setWindowTitle("Serial COM GUI — PyQt")
         self.resize(1100, 650)
 
@@ -99,20 +123,22 @@ class SerialGUI(QWidget):
         self.ser = None
         self.ser_lock = threading.Lock()
         self.reader = None
+        # collection state for Take Data
+        self._collecting = False
+        self._collect_target = 0
+        self._collect_buffer = []
+        self._collect_lock = threading.Lock()
+        # timer used to abort collection if it takes too long
+        self._collect_timer = None
+        # real-time airspeed data buffer (timestamp, value)
+        self.air_data = []
+        # y-axis displacement for airspeed plot (upper/lower = val +/- displacement)
+        self.displacement = 5.0
 
         # Layouts
         main_layout = QVBoxLayout(self)
 
-        # Top: manual send (2-line)
-        manual_layout = QHBoxLayout()
-        self.manual_text = QTextEdit()
-        self.manual_text.setFixedHeight(60)
-        manual_layout.addWidget(self.manual_text)
-
-        self.send_btn = QPushButton("Send")
-        self.send_btn.clicked.connect(self.send_manual)
-        manual_layout.addWidget(self.send_btn)
-        main_layout.addLayout(manual_layout)
+    # Top: (manual send removed)
 
         # Middle: controls for Take Data
         control_layout = QHBoxLayout()
@@ -125,12 +151,7 @@ class SerialGUI(QWidget):
         self.samples_input.editingFinished.connect(self.update_hz_estimate)
         control_layout.addWidget(self.samples_input)
 
-        hz_layout = QHBoxLayout()
-        self.hz_label = QLabel("Hz:")
-        self.hz_value = QLabel("N/A")
-        hz_layout.addWidget(self.hz_label)
-        hz_layout.addWidget(self.hz_value)
-        control_layout.addLayout(hz_layout)
+        # Frequency display removed per user request
 
         # Current airspeed display (updated from incoming serial 'H' responses)
         airspeed_layout = QHBoxLayout()
@@ -139,6 +160,8 @@ class SerialGUI(QWidget):
         airspeed_layout.addWidget(self.airspeed_label)
         airspeed_layout.addWidget(self.airspeed_value)
         control_layout.addLayout(airspeed_layout)
+
+    # displacement control for airspeed plot y-bounds (moved below the time plot)
 
         self.take_btn = QPushButton("Take Data")
         self.take_btn.clicked.connect(self.take_data)
@@ -158,6 +181,11 @@ class SerialGUI(QWidget):
         left_col = QVBoxLayout()
 
     # Table: results with horizontal scrollbar (+ remove button column)
+        # Clear All button above the table
+        self.clear_all_btn = QPushButton("Clear All")
+        self.clear_all_btn.clicked.connect(self.clear_all)
+        left_col.addWidget(self.clear_all_btn)
+
         self.table = QTableWidget(0, 4)
         self.table.setHorizontalHeaderLabels(["Wind Speed (MPH)", "Lift (lbs)", "Drag (lbs)", ""])
         # Stretch numeric columns, make remove column sized to contents
@@ -169,23 +197,40 @@ class SerialGUI(QWidget):
         self.table.setHorizontalScrollMode(QtWidgets.QAbstractItemView.ScrollPerPixel)
         left_col.addWidget(self.table)
 
-        # Bottom: log area for incoming data
-        self.log = QTextEdit()
-        self.log.setReadOnly(True)
-        left_col.addWidget(self.log)
+    # Bottom: (log console removed) — incoming lines will be printed to stdout
 
         content_layout.addLayout(left_col, 3)  # give left column more width
 
-        # Right column: Matplotlib FigureCanvas
-        self.fig = Figure(figsize=(5, 4))
+        # Right column: Matplotlib FigureCanvas with two subplots (top: lift/drag, bottom: airspeed vs time)
+        self.fig = Figure(figsize=(5, 6))
         self.canvas = FigureCanvas(self.fig)
-        self.ax = self.fig.add_subplot(111)
+        # top axes for lift/drag scatter
+        self.ax = self.fig.add_subplot(211)
         self.ax.set_xlabel("Wind Speed (MPH)")
         self.ax.set_ylabel("Lift / Drag (lbs)")
         self.ax.grid(True)
+        # bottom axes for airspeed time series
+        self.ax2 = self.fig.add_subplot(212)
+        self.ax2.set_xlabel("Seconds Past")
+        self.ax2.set_ylabel("Airspeed (MPH)")
+        self.ax2.grid(True)
+        self.fig.tight_layout()
         content_layout.addWidget(self.canvas, 4)
 
         main_layout.addLayout(content_layout)
+
+        # Y-bound (displacement) control placed below the time plot
+        disp_below_layout = QHBoxLayout()
+        # push the label+input to the far right of the window
+        disp_below_layout.addStretch()
+        self.disp_label = QLabel("y-axis offset")
+        disp_below_layout.addWidget(self.disp_label)
+        self.displacement_input = QLineEdit(str(int(self.displacement)))
+        self.displacement_input.setFixedWidth(80)
+        self.displacement_input.setValidator(QIntValidator(0, 10000, self))
+        self.displacement_input.editingFinished.connect(self.update_displacement)
+        disp_below_layout.addWidget(self.displacement_input)
+        main_layout.addLayout(disp_below_layout)
 
         # connect thread-safe logger signal
         self.log_signal.connect(self.log_message)
@@ -201,7 +246,6 @@ class SerialGUI(QWidget):
             # disable controls that require an active serial connection.
             self.log_message("No serial device selected/found — running in offline mode.")
             self.take_btn.setEnabled(False)
-            self.send_btn.setEnabled(False)
             self.save_btn.setEnabled(False)
         else:
             try:
@@ -210,7 +254,6 @@ class SerialGUI(QWidget):
                 QtWidgets.QMessageBox.warning(self, "Serial Error", f"Could not open {device}: {e}\nContinuing in offline mode.")
                 self.log_message(f"Could not open {device}: {e} — running in offline mode.")
                 self.take_btn.setEnabled(False)
-                self.send_btn.setEnabled(False)
                 self.save_btn.setEnabled(False)
             else:
                 self.log_message(f"Connected to {self.ser.port} at {self.baud} baud.")
@@ -218,20 +261,25 @@ class SerialGUI(QWidget):
                 # Start reader thread
                 self.reader = SerialReaderThread(self.ser, self.ser_lock)
                 self.reader.line_received.connect(self.on_line_received)
+                # start polling thread so H is continuously queried
+                self.reader.polling = True
+                # set a modest poll interval; tuning may be necessary for your device
+                self.reader.poll_interval = 0.05
                 self.reader.start()
 
         # Estimate hz initially
         QtCore.QTimer.singleShot(200, self.update_hz_estimate)
-        print("[debug] SerialGUI.__init__: finished setup", flush=True)
 
     def log_message(self, msg):
         timestamp = time.strftime("%H:%M:%S")
-        self.log.append(f"[{timestamp}] {msg}")
+        # Print to stdout instead of a GUI log box
+        print(f"[{timestamp}] {msg}", flush=True)
 
     def on_line_received(self, line: str):
         # Show raw incoming lines in log
         self.log_message(f"Received: {line}")
         # Try to parse first value as current airspeed and update display
+        parts = []
         try:
             parts = [p.strip() for p in line.split(',')]
             if parts and parts[0]:
@@ -242,23 +290,71 @@ class SerialGUI(QWidget):
                 except Exception:
                     # if label not present yet, ignore
                     pass
+                # append to real-time airspeed buffer and update airspeed plot
+                try:
+                    ts = time.time()
+                    self.air_data.append((ts, v))
+                    # prune to a small buffer slightly longer than 5s to avoid growth
+                    cutoff = ts - 6.0
+                    self.air_data = [(t, val) for (t, val) in self.air_data if t >= cutoff]
+                    # update airspeed time-series plot
+                    try:
+                        self.update_airspeed_plot()
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
         except Exception:
             pass
 
-    def send_manual(self):
-        text = self.manual_text.toPlainText().strip()
-        if not text:
-            return
-        if not self.ser or not self.ser.is_open:
-            QtWidgets.QMessageBox.warning(self, "Serial", "Serial port not open.")
-            return
+        # If we are currently collecting samples for Take Data, append this sample
         try:
-            with self.ser_lock:
-                self.ser.write((text + "\n").encode())
-            self.log_message(f"Sent: {text}")
-            self.manual_text.clear()
-        except Exception as e:
-            QtWidgets.QMessageBox.critical(self, "Send Error", str(e))
+            if self._collecting:
+                # expect at least three comma-separated numeric values
+                if parts and len(parts) >= 3:
+                    # input order is: airspeed, drag, lift
+                    # we want to store as: airspeed, lift, drag
+                    try:
+                        a = float(parts[0])
+                    except Exception:
+                        a = 0.0
+                    try:
+                        d = float(parts[1])
+                    except Exception:
+                        d = 0.0
+                    try:
+                        l = float(parts[2])
+                    except Exception:
+                        l = 0.0
+                    vals = [a, l, d]
+                    with self._collect_lock:
+                        self._collect_buffer.append(vals)
+                        # if we've reached the requested number of samples, finalize
+                        if len(self._collect_buffer) >= self._collect_target:
+                            # stop collection timer if running
+                            try:
+                                if self._collect_timer and self._collect_timer.isActive():
+                                    self._collect_timer.stop()
+                            except Exception:
+                                pass
+                            collected = list(self._collect_buffer)
+                            self._collecting = False
+                            # compute element-wise average
+                            sums = [0.0, 0.0, 0.0]
+                            for row in collected:
+                                for j in range(3):
+                                    sums[j] += row[j]
+                            cnt = len(collected)
+                            averaged = [s / cnt for s in sums]
+                            # deliver averaged row to GUI thread via signal
+                            self.averaged_ready.emit(averaged)
+        except Exception:
+            # non-critical - ignore
+            pass
+
+    def send_manual(self):
+        # manual send removed
+        return
 
     def estimate_roundtrip(self, trials=1):
         """Send 'H' a number of trials to estimate single-roundtrip time (seconds).
@@ -266,6 +362,14 @@ class SerialGUI(QWidget):
         """
         if not self.ser or not self.ser.is_open:
             return None
+        # Pause background reader while probing so it doesn't consume responses
+        resume_reader = False
+        if self.reader and not getattr(self.reader, '_paused', False):
+            # schedule pause on reader thread-safe flag
+            QtCore.QTimer.singleShot(0, self.reader.pause)
+            resume_reader = True
+            # give the reader a moment to pause
+            time.sleep(0.05)
         timings = []
         for _ in range(trials):
             try:
@@ -284,8 +388,52 @@ class SerialGUI(QWidget):
             except Exception:
                 return None
         if timings:
-            return sum(timings) / len(timings)
-        return None
+            result = sum(timings) / len(timings)
+        else:
+            result = None
+        # resume reader if we paused it
+        if resume_reader and self.reader:
+            QtCore.QTimer.singleShot(0, self.reader.resume)
+        return result
+
+    def estimate_total_time(self, trials=1):
+        """Send 'H' trials times and return the total elapsed seconds for all trials.
+        Returns total_time (float) on success, or None on any failure/timeout.
+        This is useful to measure the actual time to perform N samples (including
+        per-call overhead), so Hz for N samples = 1.0 / total_time.
+        """
+        if not self.ser or not self.ser.is_open:
+            return None
+        # Pause background reader while probing so it doesn't consume responses
+        resume_reader = False
+        try:
+            if self.reader and not getattr(self.reader, '_paused', False):
+                QtCore.QTimer.singleShot(0, self.reader.pause)
+                resume_reader = True
+                time.sleep(0.05)
+
+            total = 0.0
+            for _ in range(trials):
+                try:
+                    with self.ser_lock:
+                        start = time.perf_counter()
+                        self.ser.write(b"H\n")
+                        self.ser.flush()
+                        raw = self.ser.readline()
+                        end = time.perf_counter()
+                    if raw:
+                        total += (end - start)
+                    else:
+                        # timeout or empty - treat as failure
+                        total = None
+                        break
+                except Exception:
+                    total = None
+                    break
+            return total
+        finally:
+            if resume_reader and self.reader:
+                QtCore.QTimer.singleShot(0, self.reader.resume)
 
     def update_hz_estimate(self):
         txt = self.samples_input.text().strip()
@@ -294,23 +442,10 @@ class SerialGUI(QWidget):
             if n <= 0:
                 raise ValueError
         except Exception:
-            self.hz_value.setText("N/A")
+            # no frequency display - nothing to update
             return
-
-        # Start a small worker to probe without blocking UI
-        def worker():
-            # try a couple probes to get a stable estimate
-            t = self.estimate_roundtrip(trials=1)
-            if t is None or t <= 0:
-                QtCore.QTimer.singleShot(0, lambda: self.hz_value.setText("N/A"))
-                return
-            total_time = t * n
-            hz = 1.0 / total_time if total_time > 0 else 0.0
-            # update GUI in main thread
-            QtCore.QTimer.singleShot(0, lambda: self.hz_value.setText(f"{hz:.3f}"))
-
-        th = threading.Thread(target=worker, daemon=True)
-        th.start()
+        # frequency display removed; keep input validation but do not show value
+        return
 
     def take_data(self):
         txt = self.samples_input.text().strip()
@@ -327,87 +462,44 @@ class SerialGUI(QWidget):
             return
 
         self.take_btn.setEnabled(False)
-        self.send_btn.setEnabled(False)
         self.save_btn.setEnabled(False)
+        # Start collecting the next n incoming samples that the background poller emits
+        with self._collect_lock:
+            self._collect_buffer.clear()
+            self._collect_target = n
+            self._collecting = True
 
-        # Pause background reader so this worker reliably receives responses
-        if self.reader:
-            self.reader.pause()
+        # set up a timeout to abort collection if it takes too long
+        timeout_ms = max(5000, int(n * READ_TIMEOUT * 1000) + 500)
+        # stop any existing timer
+        try:
+            if self._collect_timer and self._collect_timer.isActive():
+                self._collect_timer.stop()
+        except Exception:
+            pass
 
-        def worker_take():
-            collected = []  # list of lists of floats per sample
-            for i in range(n):
-                try:
-                    with self.ser_lock:
-                        # temporarily increase serial timeout while waiting for response
-                        prev_timeout = getattr(self.ser, "timeout", None)
-                        self.ser.timeout = READ_TIMEOUT
-                        try:
-                            self.ser.write(b"H\n")
-                            self.ser.flush()
-                            raw = self.ser.readline()
-                        finally:
-                            # restore previous timeout
-                            self.ser.timeout = prev_timeout
-                    if not raw:
-                        # timeout or empty - log and continue
-                        self.log_signal.emit(f"[take_data] No response for sample {i+1}")
-                        continue
-                    line = raw.decode(errors="ignore").strip()
-                    self.log_signal.emit(f"[take_data] Sample {i+1} raw: {line}")
-                    parts = [p.strip() for p in line.split(",")]
-                    if len(parts) < 3:
-                        self.log_signal.emit(f"[take_data] Unexpected format for sample {i+1}: {line}")
-                        continue
-                    vals = []
-                    for p in parts[:3]:
-                        try:
-                            vals.append(float(p))
-                        except Exception:
-                            vals.append(0.0)
-                    collected.append(vals)
-                            # update current airspeed display from this sample
-                    try:
-                                QtCore.QTimer.singleShot(0, lambda v=vals[0]: self.airspeed_value.setText(f"{v:.3f}"))
-                    except Exception:
-                                pass
-                except Exception as e:
-                    self.log_signal.emit(f"[take_data] error: {e}")
-                    continue
+        self._collect_timer = QtCore.QTimer(self)
+        self._collect_timer.setSingleShot(True)
 
+        def on_collect_timeout():
+            with self._collect_lock:
+                collected = list(self._collect_buffer)
+                self._collecting = False
             if not collected:
-                self.log_signal.emit("[take_data] No valid samples collected.")
-                # re-enable controls on main thread
-                QtCore.QTimer.singleShot(0, self.enable_controls)
-                # also resume reader
-                if self.reader:
-                    QtCore.QTimer.singleShot(0, self.reader.resume)
+                self.log_message("[take_data] No valid samples collected (timeout).")
+                self.enable_controls()
                 return
-
-            # average element-wise
+            # average element-wise and emit
             sums = [0.0, 0.0, 0.0]
             for row in collected:
                 for j in range(3):
                     sums[j] += row[j]
             cnt = len(collected)
             averaged = [s / cnt for s in sums]
-
-            # deliver averaged row to GUI thread via signal (thread-safe)
             self.averaged_ready.emit(averaged)
-            # schedule reader resume on GUI thread
-            if self.reader:
-                QtCore.QTimer.singleShot(0, self.reader.resume)
 
-        # ensure reader is resumed if worker exits unexpectedly
-        def on_worker_done_resume():
-            if self.reader:
-                self.reader.resume()
-            QtCore.QTimer.singleShot(0, self.enable_controls)
-
-        t = threading.Thread(target=worker_take, daemon=True)
-        t.start()
-        # ensure resume eventually if something unexpected happens
-        QtCore.QTimer.singleShot(max(5000, int(n * READ_TIMEOUT * 1000) + 500), on_worker_done_resume)
+        self._collect_timer.timeout.connect(on_collect_timeout)
+        self._collect_timer.start(timeout_ms)
 
     def _add_averaged_row(self, averaged):
         """Run in main thread to add averaged row and re-enable controls."""
@@ -444,10 +536,26 @@ class SerialGUI(QWidget):
             self.table.removeRow(row)
             self.update_plot()
 
+    def clear_all(self):
+        """Clear all rows from the results table and update the plot."""
+        try:
+            self.table.setRowCount(0)
+        except Exception:
+            # fallback removal
+            try:
+                while self.table.rowCount() > 0:
+                    self.table.removeRow(0)
+            except Exception:
+                pass
+        # refresh plot
+        try:
+            self.update_plot()
+        except Exception:
+            pass
+
     @QtCore.pyqtSlot()
     def enable_controls(self):
         self.take_btn.setEnabled(True)
-        self.send_btn.setEnabled(True)
         self.save_btn.setEnabled(True)
 
     def update_plot(self):
@@ -492,6 +600,63 @@ class SerialGUI(QWidget):
         self.ax.grid(True)
         self.fig.tight_layout()
         self.canvas.draw_idle()
+
+
+    def update_airspeed_plot(self):
+        """Update the airspeed vs time line plot to show the last 5 seconds.
+        The x-axis shows seconds in range [0, 5] where 0 is now-5 and 5 is now.
+        The y-axis is centered on the latest airspeed and extends +/- displacement.
+        """
+        now = time.time()
+        # keep data within a small rolling window (slightly longer than 5s)
+        cutoff = now - 6.0
+        self.air_data = [(t, v) for (t, v) in self.air_data if t >= cutoff]
+
+        if not self.air_data:
+            self.ax2.clear()
+            self.ax2.set_xlabel("Seconds Past")
+            self.ax2.set_ylabel("Airspeed (MPH)")
+            self.ax2.grid(True)
+            self.canvas.draw_idle()
+            return
+
+        # convert to 'seconds past' where 0 is now and larger values are in the past
+        xs = [now - t for (t, v) in self.air_data]
+        ys = [v for (t, v) in self.air_data]
+
+        # draw
+        self.ax2.clear()
+        self.ax2.plot(xs, ys, linestyle='-', marker=None, color='tab:green')
+        # display last 5 seconds with 0 at the right and 5 at the left
+        self.ax2.set_xlim(5.0, 0.0)
+        # center y-limits on latest value
+        latest = ys[-1]
+        d = float(self.displacement) if self.displacement is not None else 5.0
+        self.ax2.set_ylim(latest - d, latest + d)
+        self.ax2.set_xlabel("Seconds Past")
+        self.ax2.set_ylabel("Airspeed (MPH)")
+        self.ax2.grid(True)
+        self.fig.tight_layout()
+        self.canvas.draw_idle()
+
+    def update_displacement(self):
+        txt = self.displacement_input.text().strip()
+        try:
+            v = float(txt)
+            if v < 0:
+                raise ValueError
+            self.displacement = v
+        except Exception:
+            # restore previous value
+            try:
+                self.displacement_input.setText(str(int(self.displacement)))
+            except Exception:
+                self.displacement_input.setText("5")
+        # refresh plot to apply new displacement
+        try:
+            self.update_airspeed_plot()
+        except Exception:
+            pass
 
     def export_csv(self):
         if self.table.rowCount() == 0:
