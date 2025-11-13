@@ -41,7 +41,7 @@ class LiftVsAOAGUI(QWidget):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Lift vs AOA Plotter")
+        self.setWindowTitle("AOA Plotter")
         self.resize(900, 700)
 
         main_layout = QVBoxLayout(self)
