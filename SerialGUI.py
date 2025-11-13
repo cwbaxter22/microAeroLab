@@ -19,6 +19,7 @@ from PyQt5.QtWidgets import (
 )
 
 import sys
+import os
 import threading
 import time
 import csv
@@ -31,6 +32,24 @@ from SerialFinder import select_serial_port  # uses your existing helper
 # Use Matplotlib canvas instead of Bokeh
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
+from PyQt5.QtGui import QIcon
+
+
+def make_app_icon(filename="app_icon.ico"):
+    """Resolve icon path relative to the script or PyInstaller _MEIPASS and return a QIcon.
+
+    This handles running from a different CWD and PyInstaller one-file bundles.
+    """
+    # If running in a PyInstaller bundle, resources are extracted to _MEIPASS
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        base = meipass
+    else:
+        base = os.path.dirname(os.path.abspath(__file__))
+    icon_path = os.path.join(base, filename)
+    if os.path.exists(icon_path):
+        return QIcon(icon_path)
+    return QIcon()
 
 DEFAULT_BAUD = 9600
 READ_TIMEOUT = 2.0
@@ -48,6 +67,20 @@ class SerialReaderThread(QThread):
         self.polling = True
         # seconds between polls (can be tuned)
         self.poll_interval = 0.05
+
+        # set window and application icon (helps show on taskbar)
+        try:
+            icon = make_app_icon("app_icon.ico")
+            try:
+                self.setWindowIcon(icon)
+            except Exception:
+                pass
+            try:
+                QtWidgets.QApplication.setWindowIcon(icon)
+            except Exception:
+                pass
+        except Exception:
+            pass
 
     def run(self):
         while self._running:
@@ -126,6 +159,10 @@ class SerialGUI(QWidget):
         self.baud = baud
         self.preferred_port = preferred_port
         self.ser = None
+        # timestamp of last received valid data (seconds since epoch)
+        self._last_data_ts = None
+        # whether a serial port object is present/open (separate from data flow)
+        self._port_present = False
         # connection tracking
         self._last_connected = False
         self.ser_lock = threading.Lock()
@@ -194,6 +231,16 @@ class SerialGUI(QWidget):
         control_layout.addWidget(self.status_text_label)
         # keep a non-visible port name label for internal updates (not shown)
         self.port_name_label = QLabel("None")
+        # suppress prompts for a longer window after startup so initial auto-
+        # connect logic doesn't prompt the user immediately (move this before
+        # refresh_ports so early calls respect suppression). Increase the
+        # window from 4s to 10s per user request.
+        try:
+            self._suppress_initial_prompts = True
+            QtCore.QTimer.singleShot(10000, lambda: setattr(self, '_suppress_initial_prompts', False))
+        except Exception:
+            self._suppress_initial_prompts = False
+
         # populate available ports
         try:
             ports = self.refresh_ports()
@@ -202,8 +249,14 @@ class SerialGUI(QWidget):
         # create a port-refresh timer (used while offline to detect newly-plugged devices)
         try:
             self._port_refresh_timer = QtCore.QTimer(self)
-            self._port_refresh_timer.setInterval(2000)
+            # shorter interval to detect re-plugs faster
+            self._port_refresh_timer.setInterval(800)
             self._port_refresh_timer.timeout.connect(self.refresh_ports)
+            # always start the port-refresh timer so we continuously scan for ports
+            try:
+                self._port_refresh_timer.start()
+            except Exception:
+                pass
         except Exception:
             self._port_refresh_timer = None
         # connection monitor: always check whether serial device is still present
@@ -214,8 +267,8 @@ class SerialGUI(QWidget):
             self._conn_monitor_timer.start()
         except Exception:
             self._conn_monitor_timer = None
-        except Exception:
-            pass
+        # NOTE: suppression is set earlier (before the initial refresh_ports call)
+        # so we don't prompt immediately when the app opens.
 
     # displacement control for airspeed plot y-bounds (moved below the time plot)
 
@@ -338,6 +391,11 @@ class SerialGUI(QWidget):
                 except Exception:
                     pass
                 try:
+                    # reset last-data timestamp for a fresh connection
+                    try:
+                        self._last_data_ts = None
+                    except Exception:
+                        pass
                     self.set_connection_state(True)
                 except Exception:
                     pass
@@ -358,6 +416,68 @@ class SerialGUI(QWidget):
         timestamp = time.strftime("%H:%M:%S")
         # Print to stdout instead of a GUI log box
         print(f"[{timestamp}] {msg}", flush=True)
+
+    def _update_recv_status(self):
+        """Update the CONNECTED/OFFLINE UI based on whether data is being received.
+
+        Rules:
+        - If no serial port is present, show OFFLINE.
+        - If a serial port is present and we've received valid data within
+          a short threshold, show CONNECTED. Otherwise show OFFLINE.
+        """
+        try:
+            now = time.time()
+            # threshold: consider data recent if within ~2.5 seconds
+            threshold = max(1.0, READ_TIMEOUT * 1.25)
+            has_recent = self._last_data_ts is not None and (now - self._last_data_ts) <= threshold
+
+            if not getattr(self, '_port_present', False):
+                # no port object -> offline visual state
+                self.status_text_label.setText("OFFLINE")
+                self.status_text_label.setStyleSheet("font-weight:bold; color: red;")
+                # ensure offline flash timer exists and is started
+                if not hasattr(self, '_offline_flash_timer'):
+                    self._offline_flash_timer = QtCore.QTimer(self)
+                    self._offline_flash_timer.setInterval(600)
+                    self._offline_flash_timer.timeout.connect(self._toggle_offline_light)
+                    self._offline_light_on = False
+                try:
+                    if not self._offline_flash_timer.isActive():
+                        self._offline_flash_timer.start()
+                except Exception:
+                    pass
+                try:
+                    self.status_light.setStyleSheet("border-radius:7px; background: transparent;")
+                except Exception:
+                    pass
+            else:
+                # port present: reflect data reception
+                if has_recent:
+                    # show connected
+                    try:
+                        if hasattr(self, '_offline_flash_timer') and self._offline_flash_timer.isActive():
+                            try:
+                                self._offline_flash_timer.stop()
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
+                    try:
+                        self.status_text_label.setText("CONNECTED")
+                        self.status_text_label.setStyleSheet("font-weight:bold; color: green;")
+                        self.status_light.setStyleSheet("border-radius:7px; background: green;")
+                    except Exception:
+                        pass
+                else:
+                    # no recent data -> offline visuals
+                    try:
+                        self.status_text_label.setText("OFFLINE")
+                        self.status_text_label.setStyleSheet("font-weight:bold; color: red;")
+                        self.status_light.setStyleSheet("border-radius:7px; background: transparent;")
+                    except Exception:
+                        pass
+        except Exception:
+            pass
 
     def refresh_ports(self):
         """Refresh the list of available serial ports into the combo box."""
@@ -381,25 +501,58 @@ class SerialGUI(QWidget):
             idx = ports.index(cur)
             self.port_combo.setCurrentIndex(idx)
         self.port_combo.blockSignals(False)
-        # If we're currently offline, attempt an auto-connect if a port appears.
+        # Always prefer the configured preferred_port if it appears. If preferred
+        # is found and we're not already connected to it, switch to it. If no
+        # preferred is present and we're not connected, auto-connect to the
+        # first available port.
         try:
-            offline = False
             try:
-                offline = (self.status_text_label.text().upper() == "OFFLINE")
+                ser_port = getattr(self.ser, 'port', None) if self.ser else None
+                is_open = bool(self.ser and getattr(self.ser, 'is_open', False))
             except Exception:
-                offline = (not (self.ser and getattr(self.ser, 'is_open', False)))
-            if offline and ports:
-                # prefer preferred_port if present
+                ser_port = None
+                is_open = False
+            pref = getattr(self, 'preferred_port', None)
+            if pref and pref in ports:
+                # connect to preferred if not already connected
+                if not (is_open and ser_port == pref):
+                    # During initial startup we auto-connect silently to preferred
+                    if getattr(self, '_suppress_initial_prompts', False):
+                        try:
+                            idx = ports.index(pref)
+                            self.port_combo.setCurrentIndex(idx)
+                            QtCore.QTimer.singleShot(0, self.on_port_selected)
+                        except Exception:
+                            pass
+                        return
+                    try:
+                        # Prompt the user before switching ports
+                        reply = QtWidgets.QMessageBox.question(
+                            self,
+                            "Switch serial port",
+                            f"Preferred port {pref} is available. Switch from {ser_port or 'None'} to {pref}?",
+                            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+                        )
+                        if reply == QtWidgets.QMessageBox.Yes:
+                            idx = ports.index(pref)
+                            self.port_combo.setCurrentIndex(idx)
+                            QtCore.QTimer.singleShot(0, self.on_port_selected)
+                        # if No, leave current connection alone
+                    except Exception:
+                        # fallback: auto-connect to preferred if prompting fails
+                        try:
+                            idx = ports.index(pref)
+                            self.port_combo.setCurrentIndex(idx)
+                            QtCore.QTimer.singleShot(0, self.on_port_selected)
+                        except Exception:
+                            pass
+                    return
+            # no preferred or preferred not present: if we're currently offline,
+            # try to auto-connect to the first available port
+            if not (is_open) and ports:
                 try:
-                    pref = getattr(self, 'preferred_port', None)
-                    if pref and pref in ports:
-                        idx = ports.index(pref)
-                        self.port_combo.setCurrentIndex(idx)
-                        QtCore.QTimer.singleShot(0, self.on_port_selected)
-                    else:
-                        # otherwise try the first available port
-                        self.port_combo.setCurrentIndex(0)
-                        QtCore.QTimer.singleShot(0, self.on_port_selected)
+                    self.port_combo.setCurrentIndex(0)
+                    QtCore.QTimer.singleShot(0, self.on_port_selected)
                 except Exception:
                     pass
         except Exception:
@@ -457,6 +610,12 @@ class SerialGUI(QWidget):
         except Exception:
             pass
         try:
+            # reset last-data timestamp for a fresh connection; don't consider
+            # previous data as valid for this newly-opened port
+            try:
+                self._last_data_ts = None
+            except Exception:
+                pass
             self.set_connection_state(True)
         except Exception:
             pass
@@ -475,41 +634,22 @@ class SerialGUI(QWidget):
         'CONNECTED'. If False, show 'OFFLINE' and flash a red light.
         """
         try:
-            if connected:
-                # stop any offline flashing
-                if hasattr(self, '_offline_flash_timer') and self._offline_flash_timer.isActive():
-                    try:
-                        self._offline_flash_timer.stop()
-                    except Exception:
-                        pass
-                # stop port refresh timer while connected
+            # remember whether a serial port object is present; actual CONNECTED
+            # vs OFFLINE visuals are driven by recent data reception in
+            # _update_recv_status()
+            self._port_present = bool(connected)
+            # If we are not connected, clear the last-data timestamp so a
+            # stale timestamp from a previous session doesn't make the UI
+            # show CONNECTED.
+            if not connected:
                 try:
-                    if hasattr(self, '_port_refresh_timer') and self._port_refresh_timer is not None and self._port_refresh_timer.isActive():
-                        self._port_refresh_timer.stop()
+                    self._last_data_ts = None
                 except Exception:
                     pass
-                self.status_text_label.setText("CONNECTED")
-                self.status_text_label.setStyleSheet("font-weight:bold; color: green;")
-                self.status_light.setStyleSheet("border-radius:7px; background: green;")
-            else:
-                self.status_text_label.setText("OFFLINE")
-                self.status_text_label.setStyleSheet("font-weight:bold; color: red;")
-                # ensure flash timer exists
-                if not hasattr(self, '_offline_flash_timer'):
-                    self._offline_flash_timer = QtCore.QTimer(self)
-                    self._offline_flash_timer.setInterval(600)
-                    self._offline_flash_timer.timeout.connect(self._toggle_offline_light)
-                    self._offline_light_on = False
-                try:
-                    self._offline_flash_timer.start()
-                except Exception:
-                    pass
-                # start port refresh timer while offline so newly-plugged devices are found
-                try:
-                    if hasattr(self, '_port_refresh_timer') and self._port_refresh_timer is not None and not self._port_refresh_timer.isActive():
-                        self._port_refresh_timer.start()
-                except Exception:
-                    pass
+            try:
+                self._update_recv_status()
+            except Exception:
+                pass
         except Exception:
             pass
 
@@ -563,6 +703,11 @@ class SerialGUI(QWidget):
                     self.ser = None
                 except Exception:
                     pass
+                # clear last-data timestamp so stale data doesn't show CONNECTED
+                try:
+                    self._last_data_ts = None
+                except Exception:
+                    pass
                 try:
                     self.port_name_label.setText("None")
                 except Exception:
@@ -604,6 +749,11 @@ class SerialGUI(QWidget):
                 try:
                     ts = time.time()
                     self.air_data.append((ts, v))
+                    # record time of last successful data reception
+                    try:
+                        self._last_data_ts = ts
+                    except Exception:
+                        pass
                     # prune to a small buffer slightly longer than 5s to avoid growth
                     cutoff = ts - 6.0
                     self.air_data = [(t, val) for (t, val) in self.air_data if t >= cutoff]
@@ -612,6 +762,11 @@ class SerialGUI(QWidget):
                         self.update_airspeed_plot()
                     except Exception:
                         pass
+                except Exception:
+                    pass
+                # update status visuals to reflect that data was just received
+                try:
+                    self._update_recv_status()
                 except Exception:
                     pass
         except Exception:
@@ -1020,6 +1175,15 @@ def main():
         pass
     w = SerialGUI(preferred_port="COM5", baud=DEFAULT_BAUD)
     w.show()
+    # If PyInstaller bootloader splash was used, close it now so it doesn't persist.
+    try:
+        import pyi_splash
+        try:
+            pyi_splash.close()
+        except Exception:
+            pass
+    except Exception:
+        pass
     sys.exit(app.exec_())
 
 
